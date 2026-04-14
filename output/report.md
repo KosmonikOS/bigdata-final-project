@@ -89,3 +89,89 @@ The target variable for predictive modeling is `loan_status`. In the raw dataset
 A particularly important part of the selected feature set is the presence of time-related variables, especially `issue_d` and `earliest_cr_line`. These columns preserve the temporal structure of the data and support both analysis and feature engineering. The `issue_d` field can be used to study how issuance activity and default behavior change over time, while `earliest_cr_line` makes it possible to derive the borrower’s credit history length, which is a meaningful indicator of credit risk.
 
 During the **Data Ingestion** stage, both `issue_d` and `earliest_cr_line` are converted from raw string values into proper datetime columns immediately after the dataset is downloaded. They are then preserved as datetime values throughout the full pipeline. This ensures consistent handling of temporal information across PostgreSQL, HDFS, Hive, Spark, and downstream analytics.
+
+---
+
+## Stage 1 — Data Collection and Ingestion
+
+The goal of this stage is to collect the raw dataset, load it into a relational database, and transfer it to HDFS for distributed processing. The entire workflow is driven by two scripts, `preprocess.sh` and `stage1.sh`, and runs end-to-end without manual steps.
+
+### Data Collection
+
+The raw dataset is downloaded from a public Yandex Disk share using the Yandex Disk public API. The script `download_from_yandex_disk.py` resolves the share URL to a temporary direct download link, fetches the zip archive, and writes it to the `data/` directory. The archive is then extracted to produce `data/dataset.csv`. No credentials or third-party CLI tools are required.
+
+### Preprocessing
+
+The raw file contains 151 columns, of which we retain 26 that are available at loan origination time and are relevant to the prediction task. The script `filter_dataset_for_pg.py` applies three normalization steps before the data reaches the database: date strings in `Mon-YYYY` format are converted to ISO `YYYY-MM-DD`; the `term` field (e.g. `"36 months"`) is reduced to a plain integer; and percent signs are stripped from rate fields such as `int_rate` and `revol_util`. Rows with a missing `id` or an unparseable date are dropped. The cleaned data is written to `data/dataset_filtered.csv`.
+
+### Relational Database
+
+The table `loans` has 26 columns with types chosen to match the data: `BIGINT` for the primary key, `DOUBLE PRECISION` for continuous financial values, `DATE` for temporal fields, `INTEGER` for count fields, and `TEXT` for categorical fields. Five CHECK constraints enforce domain integrity: non-negative values for count columns, correct FICO range ordering (`fico_range_low` ≤ `fico_range_high`), positive loan term, non-negative revolving balance, and valid numeric ranges for rates and amounts. The script `load_postgres.py` reads the DDL from `sql/import_data.sql`, drops and recreates the table to guarantee idempotency, bulk-loads the filtered CSV using the `COPY FROM STDIN` statement via `psycopg2`, and runs `ANALYZE` to update planner statistics.
+
+### HDFS Ingestion
+
+The script `stage1.sh` transfers the PostgreSQL table to HDFS using **Apache Sqoop**. Before each import, the target directory is cleared with `hdfs dfs -rm -rf` to ensure the pipeline can be re-run cleanly. Sqoop reads the table with 4 parallel mappers, splitting the work by the `id` column.
+
+### File Format and Compression
+
+We use **Parquet** format with **Snappy** compression for all HDFS data. The downstream stages — Hive queries and Spark analytics — read the dataset many times but write it only once at ingestion. Parquet's columnar layout means each query reads only the columns it needs, which significantly reduces I/O compared to row-oriented formats such as Avro. Snappy decompresses faster than gzip or bzip2 at the cost of a slightly larger file size, keeping query latency low. This combination is well-suited to read-heavy analytical workloads where throughput matters more than maximum compression ratio, as supported by comparative benchmarks in the literature.
+
+### Results
+
+The `loans` table was loaded into the `team25_projectdb` PostgreSQL database with 2,260,701 rows. Sqoop exported the table to HDFS at `/user/team25/loans` as a Snappy-compressed Parquet file. A copy of the Parquet file is archived in the `output/` directory of the repository.
+
+---
+
+## Stage 2 — Data Storage and Preparation
+
+The goal of this stage is to register the HDFS Parquet data in Apache Hive, apply the necessary type corrections, and organize the dataset into a partitioned and bucketed table optimized for analytical queries. The entire workflow is driven by `scripts/load_hive.py` and `scripts/stage2.sh`, and runs end-to-end without manual steps.
+
+### Hive Database
+
+The script `load_hive.py` creates the Hive database `team25_projectdb` in the metastore via `CREATE DATABASE IF NOT EXISTS`. All managed table data is written to `HIVE_WAREHOUSE_DIR` (`/user/team25/project/hive/warehouse`), which is distinct from the Sqoop import path (`/user/team25/loans`) to keep raw ingestion data and Hive-managed data in separate HDFS locations.
+
+#### Staging Table
+
+`loans_staging` is an external Parquet table whose `LOCATION` points directly at the Sqoop output directory. It exposes the dataset with the raw Sqoop column types: `issue_d` and `earliest_cr_line` are represented as `BIGINT` millisecond timestamps, which is how Sqoop serializes `DATE` columns into Parquet. The table is dropped at the end of the pipeline; the underlying HDFS files are not modified.
+
+#### Type Conversion
+
+An intermediate managed table `loans_unpart` is created from `loans_staging` via CTAS. The two timestamp columns are converted to native `DATE` values using `CAST(TO_DATE(FROM_UNIXTIME(CAST(col / 1000 AS BIGINT))) AS DATE)`, which divides milliseconds to seconds before applying the Unix epoch conversion. All 25 remaining columns are carried through unchanged. The table is dropped once its data has been transferred into the final partitioned table.
+
+#### Partitioned and Bucketed Table
+
+The final table `loans` is an external table partitioned by `grade` and clustered by `id` into 8 buckets, stored as Snappy-compressed Parquet under `HIVE_WAREHOUSE_DIR/loans`.
+
+The `grade` column was chosen as the partition key because it is a bounded seven-value categorical (A–G) that directly encodes the Lending Club credit risk tier. Partitioning on `grade` means queries filtered by risk level — common in both exploratory analysis and model evaluation — scan only the relevant partition rather than the full dataset. Seven partitions are small enough to avoid NameNode metadata pressure while producing meaningful data slices of roughly 314 K rows each on average.
+
+Bucketing by `id` with 8 buckets per partition was chosen because `id` is the primary key and has a uniform distribution, making it ideal for hash-based splitting. Eight buckets yield approximately 39 K rows per file, which is large enough for Tez to process efficiently without incurring small-file overhead. Bucketing by the primary key also enables efficient map-side joins in future Spark stages if a secondary lookup table keyed on `id` is introduced.
+
+The table is declared `EXTERNAL` so that the curated data at `HIVE_WAREHOUSE_DIR/loans` survives a `DROP TABLE` during a pipeline re-run; only the metastore entry is removed. Dynamic partitioning (`hive.exec.dynamic.partition=true`, mode `nonstrict`) is enabled so that a single `INSERT INTO loans PARTITION (grade) SELECT ... FROM loans_unpart` populates all seven grade partitions automatically without requiring a separate query per partition value.
+
+### Exploratory Data Analysis
+
+Six HiveQL queries are executed against the `loans` Hive table to surface patterns relevant to default prediction and portfolio management. Each query stores its aggregated results in a dedicated managed ORC table (`q1_results` through `q6_results`) and exports them to `output/q1.csv`–`output/q6.csv`. The results are visualized in Apache Superset using diverse chart types: bar, horizontal bar, line, heatmap, and bubble chart. All queries restrict analysis to completed loans with a known final outcome — `Fully Paid`, `Charged Off`, `Default`, and their policy-exception variants — to ensure the denominator reflects only resolved cases.
+
+#### Default Rate by Loan Grade
+
+The bar chart (Q1) plots default rate and average interest rate for each of Lending Club's seven grade tiers (A–G). Default rate rises monotonically from 6% at grade A to 50% at grade G, and average interest rate tracks the same gradient from 7% to 28%. The parallel movement of interest rate and default rate confirms that Lending Club's pricing model accurately captures credit risk: borrowers assigned a higher-risk grade are charged proportionally higher rates. From a prediction standpoint, `grade` is the single strongest categorical predictor available at origination time, and the seven-value partition structure of the Hive table means grade-filtered queries run with no full-table scans.
+
+#### Default Rate by Loan Purpose
+
+The horizontal bar chart (Q2) ranks all 14 loan purposes by default rate alongside their loan volumes. `small_business` loans carry the highest default rate at approximately 30%, followed by `renewable_energy` and `moving` at around 23%. The safest purposes are `wedding` and `car` at 12–14%. `debt_consolidation` dominates the portfolio by volume — nearly 800 thousand completed loans — yet sits at a moderate 21% default rate, close to the dataset average. The divergence between volume and risk makes purpose a useful feature: the most common loan purpose is not the riskiest, so the model must treat this as a categorical signal rather than a proxy for data density.
+
+#### Default Rate over Time
+
+The line chart (Q3) tracks completed-loan volume and default rate by issue year from 2007 to 2018. Loan issuance grew from a few thousand records in 2007 to a peak of roughly 375 thousand in 2015, then declined as the dataset ends partway through 2018. The default rate began at approximately 26% in 2007 — a small early cohort with elevated risk — dropped sharply to around 14% in 2008–2010 as post-financial-crisis underwriting tightened, and then gradually climbed back to 23% by 2016–2017 as Lending Club expanded its borrower base. The apparent decline to 16% in 2018 is an artifact of loan immaturity: recently issued loans have not had sufficient time to default, so the completed-loan filter underrepresents defaults for the most recent cohorts. This temporal non-stationarity means a machine learning model should not be trained and evaluated on a random split; a time-based split is required to avoid leakage.
+
+#### Default Rate by Debt-to-Income Ratio
+
+The bar chart (Q4) groups borrowers into five DTI buckets (0–10, 10–20, 20–30, 30–40, 40+) and plots the default rate for each. The relationship is near-monotonic: 15% for the lowest bucket, rising through 18%, 23%, and 29%, to 31% for DTI above 40. Each 10-point increment in DTI adds approximately 4–5 percentage points to the default rate, making DTI the strongest continuous numeric predictor in the dataset. Two known data quality issues were handled in the query: DTI values of −1 and 999, present in a small number of records, are excluded with a `dti >= 0 AND dti <= 100` filter.
+
+#### Interaction Effect: Grade and Home Ownership
+
+The heatmap (Q5) shows default rates for all 21 combinations of loan grade (A–G, columns) and home ownership status (MORTGAGE, OWN, RENT, rows). The grade gradient dominates: default rates span roughly 40 percentage points across the A-to-G axis within every ownership category. Within each grade, however, home ownership provides a consistent secondary signal. MORTGAGE borrowers default least (grade A: 5.19%, grade G: 45.13%), OWN borrowers fall in the middle (6.79% to 49.86%), and RENT borrowers default most (7.34% to 54.5%). The within-grade spread across ownership categories ranges from approximately 2 percentage points at grade A to 9 percentage points at grade G, indicating that housing stability adds predictive value beyond the grade label alone, particularly for higher-risk borrowers.
+
+#### FICO Score and Default Risk
+
+The bubble chart (Q6) plots average FICO score against default rate for six score buckets (610–650 through 750+), with bubble area proportional to the number of completed loans in each bucket. The relationship is monotonically negative and nearly linear: default rate falls from approximately 32% at the 610–650 bucket to 9% at 750+, with each 25-point FICO increment reducing default rate by around 4–5 percentage points. The 675–700 bucket is the largest, reflecting the concentration of Lending Club's borrower base in the near-prime credit range. The small 610–650 bubble confirms that very low FICO scores are rare in the accepted-loan population — consistent with Lending Club's minimum credit score requirements — but when they occur they carry a disproportionately high default rate.
