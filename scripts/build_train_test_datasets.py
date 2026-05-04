@@ -2,11 +2,15 @@
 
 import os
 
+from dotenv import load_dotenv
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import OneHotEncoder, StringIndexer, VectorAssembler
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.ml import Pipeline
-from pyspark.ml.feature import StringIndexer, VectorAssembler, OneHotEncoder
 
+from ml_utils import read_hive
+
+load_dotenv()
 
 ML_PREPARED_RAW_PATH = os.environ.get(
     "ML_PREPARED_RAW_PATH",
@@ -93,7 +97,7 @@ def build_label_distribution_df(df, dataset_name):
     return distribution_df
 
 
-def build_split_summary_df(
+def build_split_summary_df(  # pylint: disable=too-many-positional-arguments
     spark,
     train_raw_count,
     test_raw_count,
@@ -338,7 +342,7 @@ def main():
     spark = build_spark()
 
     print("Reading prepared raw dataset from:", ML_PREPARED_RAW_PATH)
-    df = spark.read.parquet(ML_PREPARED_RAW_PATH)
+    df = read_hive(spark, ML_PREPARED_RAW_PATH)
 
     print("\nInput schema")
     df.printSchema()
